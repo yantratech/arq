@@ -16,7 +16,7 @@ from redis.exceptions import ResponseError, WatchError
 from arq.cron import CronJob
 from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
 
-from .abort import cleanup_abort_requests
+from .abort import cleanup_abort_requests, take_abort_requests
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
 from .constants import (
     abort_jobs_ss,
@@ -410,16 +410,11 @@ class Worker:
         """
         Go through job_ids in the abort_jobs_ss sorted set and cancel those tasks.
         """
-        job_tasks = {job_id: task for job_id, task in self.job_tasks.items() if job_id not in self.aborting_tasks}
-        if job_tasks:
-            async with self.pool.pipeline(transaction=False) as pipe:
-                for job_id in job_tasks:
-                    pipe.zscore(abort_jobs_ss, job_id)
-                scores = await pipe.execute()
-
-            for (job_id, task), score in zip(job_tasks.items(), scores):
-                if score is not None and self.job_tasks.get(job_id) is task and task.cancel():
-                    self.aborting_tasks.add(job_id)
+        job_tasks = self.job_tasks.copy()
+        for job_id in await take_abort_requests(self.pool, list(job_tasks)):
+            task = job_tasks[job_id]
+            if self.job_tasks.get(job_id) is task and task.cancel():
+                self.aborting_tasks.add(job_id)
 
         self._abort_scan_cursor = await cleanup_abort_requests(self.pool, self._abort_scan_cursor)
 
@@ -614,7 +609,6 @@ class Worker:
                 logger.info('%6.2fs ⊘ %s aborted', t, ref)
                 result = e
                 finish = True
-                self.aborting_tasks.remove(job_id)
                 self.jobs_failed += 1
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
                 logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
@@ -632,6 +626,8 @@ class Worker:
             logger.info('%6.2fs ← %s ● %s', (finished_ms - start_ms) / 1000, ref, result_str)
             finish = True
             self.jobs_complete += 1
+        finally:
+            self.aborting_tasks.discard(job_id)
 
         keep_result_forever = (
             self.keep_result_forever if function.keep_result_forever is None else function.keep_result_forever

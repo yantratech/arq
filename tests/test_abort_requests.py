@@ -113,3 +113,56 @@ async def test_abort_without_retained_result_is_unconfirmed(arq_redis, worker):
     await worker(functions=[func(must_not_run, name='must_not_run')], allow_abort_jobs=True, keep_result=0).main()
     assert await job.abort(timeout=0) is False
     assert await Job(job.job_id, arq_redis).result_info() is None
+
+
+async def test_reused_job_id_can_abort_after_suppressed_cancellation(arq_redis, worker):
+    started = asyncio.Event()
+    runs = 0
+
+    async def sometimes_suppress(ctx):
+        nonlocal runs
+        runs += 1
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if runs != 1:
+                raise
+
+    w = worker(functions=[func(sometimes_suppress, name='job')], allow_abort_jobs=True, keep_result=0)
+    for _ in range(2):
+        started.clear()
+        await arq_redis.enqueue_job('job', _job_id='reused')
+        run = asyncio.create_task(w.main())
+        await started.wait()
+        await arq_redis.zadd(abort_jobs_ss, {'reused': timestamp_ms()})
+        await run
+        assert w.aborting_tasks == set()
+
+    assert w.jobs_complete == 1
+    assert w.jobs_failed == 1
+
+
+async def test_fresh_request_can_cancel_a_task_that_suppressed_one_request(arq_redis, worker):
+    started = asyncio.Event()
+    suppressed = asyncio.Event()
+
+    async def suppress_once(ctx):
+        started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            suppressed.set()
+            await asyncio.sleep(3600)
+
+    await arq_redis.enqueue_job('job', _job_id='running')
+    w = worker(functions=[func(suppress_once, name='job')], allow_abort_jobs=True)
+    run = asyncio.create_task(w.main())
+    await started.wait()
+    await arq_redis.zadd(abort_jobs_ss, {'running': timestamp_ms()})
+    await suppressed.wait()
+    await arq_redis.zadd(abort_jobs_ss, {'running': timestamp_ms()})
+    await run
+
+    assert w.jobs_failed == 1
+    assert w.aborting_tasks == set()

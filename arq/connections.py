@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from operator import attrgetter
@@ -13,6 +14,7 @@ from redis.asyncio.retry import Retry
 from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
+from .abort import request_abort_jobs
 from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
 from .utils import timestamp_ms, to_ms, to_unix_ms
@@ -179,6 +181,26 @@ class ArqRedis(BaseRedis):
                 # job got enqueued since we checked 'job_exists'
                 return None
         return Job(job_id, redis=self, _queue_name=_queue_name, _deserializer=self.job_deserializer)
+
+    async def request_abort_jobs(self, job_ids: Iterable[str], *, queue_name: Optional[str] = None) -> None:
+        """Request cancellation without waiting for job results.
+
+        IDs are deduplicated and submitted in batches of at most 100. Each batch
+        atomically marks jobs still queued or in progress and promotes deferred
+        queue entries so workers can process their cancellation. Missing jobs are
+        ignored. No job payloads or results are read or deserialized.
+
+        Workers require ``allow_abort_jobs=True``. Returning means submission
+        completed, not that jobs stopped. Jobs may complete normally before the
+        worker handles the request. Use ``Job.abort()`` for result confirmation.
+        A Redis error or caller cancellation propagates; earlier batches may
+        already have been submitted. Retrying submission is safe for the same jobs,
+        but job IDs must not be reused for unrelated work during cancellation.
+
+        :param job_ids: iterable of job IDs; a bare string is rejected
+        :param queue_name: queue containing the jobs; defaults to this pool's queue
+        """
+        await request_abort_jobs(self, job_ids, self.default_queue_name if queue_name is None else queue_name)
 
     async def _get_job_result(self, key: bytes) -> JobResult:
         job_id = key[len(result_key_prefix) :].decode()

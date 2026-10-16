@@ -1,5 +1,7 @@
 """Redis operations shared by cancellation producers and workers."""
 
+from collections.abc import Iterable
+
 from redis.asyncio import Redis
 
 from .constants import abort_job_max_age, abort_jobs_ss, in_progress_key_prefix, job_key_prefix
@@ -54,3 +56,35 @@ async def take_abort_requests(redis: 'Redis[bytes]', job_ids: list[str]) -> list
         requested.extend(job_id.decode() for job_id in ids)
 
     return requested
+
+
+_REQUEST_ABORTS = """
+local now = tonumber(ARGV[1])
+for i = 3, #ARGV do
+    local id = ARGV[i]
+    local score = redis.call('ZSCORE', KEYS[1], id)
+    if score or redis.call('EXISTS', ARGV[2] .. id) == 1 then
+        redis.call('ZADD', KEYS[2], now, id)
+        if score and tonumber(score) > now then
+            redis.call('ZADD', KEYS[1], 'XX', 1, id)
+        end
+    end
+end
+"""
+
+
+async def request_abort_jobs(redis: 'Redis[bytes]', job_ids: Iterable[str], queue_name: str) -> None:
+    if isinstance(job_ids, (str, bytes)):
+        raise TypeError('job_ids must be an iterable of job IDs, not a single string')
+
+    unique_ids = list(dict.fromkeys(job_ids))
+    for start in range(0, len(unique_ids), 100):
+        await redis.eval(  # type: ignore[no-untyped-call]  # Redis 4's stubs leave EVAL untyped.
+            _REQUEST_ABORTS,
+            2,
+            queue_name,
+            abort_jobs_ss,
+            timestamp_ms(),
+            in_progress_key_prefix,
+            *unique_ids[start : start + 100],
+        )

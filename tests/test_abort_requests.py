@@ -9,13 +9,19 @@ from arq.utils import timestamp_ms
 from arq.worker import func
 
 
-async def test_abort_propagates_caller_cancellation(arq_redis):
+async def test_abort_propagates_caller_cancellation(arq_redis, mocker):
+    waiting_for_result = asyncio.Event()
+
+    async def controlled_poll(_delay):
+        yield 0
+        waiting_for_result.set()
+        await asyncio.sleep(3600)
+
+    mocker.patch('arq.jobs.poll', controlled_poll)
     job = await arq_redis.enqueue_job('pending', _job_id='pending')
     task = asyncio.create_task(job.abort(poll_delay=0.001))
     try:
-        while await arq_redis.zscore(abort_jobs_ss, job.job_id) is None:
-            await asyncio.sleep(0)
-
+        await waiting_for_result.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

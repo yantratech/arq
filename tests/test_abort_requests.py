@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from arq.abort import cleanup_abort_requests
+from arq.abort import cleanup_abort_requests, remove_abort_requests
 from arq.constants import abort_jobs_ss, in_progress_key_prefix
 from arq.jobs import Job, JobStatus
 from arq.utils import timestamp_ms
@@ -166,3 +166,37 @@ async def test_fresh_request_can_cancel_a_task_that_suppressed_one_request(arq_r
 
     assert w.jobs_failed == 1
     assert w.aborting_tasks == set()
+
+
+async def test_consumption_failure_does_not_lose_uncancelled_requests(arq_redis, worker, mocker):
+    async def pending():
+        await asyncio.sleep(3600)
+
+    w = worker(functions=[func(pending, name='unused')], allow_abort_jobs=True)
+    tasks = {f'job-{i}': asyncio.create_task(pending()) for i in range(101)}
+    w.job_tasks.update(tasks)
+    await arq_redis.zadd(abort_jobs_ss, dict.fromkeys(tasks, timestamp_ms()))
+    mocker.patch('arq.worker.remove_abort_requests', side_effect=ConnectionError('offline'))
+    try:
+        with pytest.raises(ConnectionError, match='offline'):
+            await w._cancel_aborted_jobs()
+
+        await asyncio.sleep(0)
+        assert all(task.cancelled() for task in list(tasks.values())[:100])
+        assert not tasks['job-100'].done()
+        assert await arq_redis.zcard(abort_jobs_ss) == 101
+    finally:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        w.job_tasks.clear()
+
+
+async def test_consumption_preserves_a_refreshed_request(arq_redis):
+    now = timestamp_ms()
+    await arq_redis.zadd(abort_jobs_ss, {'running': now + 1})
+    await remove_abort_requests(arq_redis, {'running': now})
+    assert await arq_redis.zscore(abort_jobs_ss, 'running') == now + 1
+
+    await remove_abort_requests(arq_redis, {'running': now + 1})
+    assert await arq_redis.zscore(abort_jobs_ss, 'running') is None

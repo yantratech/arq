@@ -87,6 +87,11 @@ jobs:
 
     - run: uv sync --group testing --extra watch
 
+    - name: Pull test containers
+      run: |
+        docker pull "redis:${ARQ_TEST_REDIS_VERSION}"
+        docker pull "$(uv run python -c 'from testcontainers.core.config import testcontainers_config; print(testcontainers_config.ryuk_image)')"
+
     - run: make test
 
     - run: uv run coverage xml

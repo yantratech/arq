@@ -1,4 +1,8 @@
-# arq
+# arq — Yantra fork
+
+This is [Yantra’s fork](https://github.com/yantratech/arq) of [python-arq/arq](https://github.com/python-arq/arq), maintained for Yantra applications. The MIT license and upstream attribution apply. Engineering has write access; changes are reviewed through pull requests.
+
+See the [maintainer knowledge base](docs/knowledge-base.md) for development, dependency pins and cancellation semantics. The badges below describe the upstream package.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/samuelcolvin/arq/ci.yml?branch=main&logo=github&label=CI)](https://github.com/samuelcolvin/arq/actions?query=event%3Apush+branch%3Amain+workflow%3ACI)
 [![Coverage](https://codecov.io/gh/samuelcolvin/arq/branch/main/graph/badge.svg)](https://codecov.io/gh/samuelcolvin/arq)

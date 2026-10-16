@@ -16,7 +16,7 @@ from redis.exceptions import ResponseError, WatchError
 from arq.cron import CronJob
 from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
 
-from .abort import cleanup_abort_requests, take_abort_requests
+from .abort import cleanup_abort_requests, remove_abort_requests
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
 from .constants import (
     abort_jobs_ss,
@@ -410,11 +410,21 @@ class Worker:
         """
         Go through job_ids in the abort_jobs_ss sorted set and cancel those tasks.
         """
-        job_tasks = self.job_tasks.copy()
-        for job_id in await take_abort_requests(self.pool, list(job_tasks)):
-            task = job_tasks[job_id]
-            if self.job_tasks.get(job_id) is task and task.cancel():
-                self.aborting_tasks.add(job_id)
+        job_tasks = list(self.job_tasks.items())
+        for start in range(0, len(job_tasks), 100):
+            batch = job_tasks[start : start + 100]
+            async with self.pool.pipeline(transaction=False) as pipe:
+                for job_id, _ in batch:
+                    pipe.zscore(abort_jobs_ss, job_id)
+                scores = await pipe.execute()
+
+            cancelled: dict[str, float] = {}
+            for (job_id, task), score in zip(batch, scores):
+                if score is not None and self.job_tasks.get(job_id) is task and task.cancel():
+                    self.aborting_tasks.add(job_id)
+                    cancelled[job_id] = score
+
+            await remove_abort_requests(self.pool, cancelled)
 
         self._abort_scan_cursor = await cleanup_abort_requests(self.pool, self._abort_scan_cursor)
 

@@ -36,26 +36,22 @@ async def cleanup_abort_requests(redis: 'Redis[bytes]', cursor: int) -> int:
     )
 
 
-_TAKE_ABORT_REQUESTS = """
-local requested = {}
-for _, id in ipairs(ARGV) do
-    if redis.call('ZREM', KEYS[1], id) == 1 then
-        table.insert(requested, id)
+_REMOVE_ABORT_REQUESTS = """
+for i = 1, #ARGV, 2 do
+    local score = redis.call('ZSCORE', KEYS[1], ARGV[i])
+    if score and tonumber(score) == tonumber(ARGV[i + 1]) then
+        redis.call('ZREM', KEYS[1], ARGV[i])
     end
 end
-return requested
 """
 
 
-async def take_abort_requests(redis: 'Redis[bytes]', job_ids: list[str]) -> list[str]:
-    requested: list[str] = []
-    for start in range(0, len(job_ids), 100):
-        ids = await redis.eval(  # type: ignore[no-untyped-call]  # Redis 4's stubs leave EVAL untyped.
-            _TAKE_ABORT_REQUESTS, 1, abort_jobs_ss, *job_ids[start : start + 100]
+async def remove_abort_requests(redis: 'Redis[bytes]', requests: dict[str, float]) -> None:
+    if requests:
+        args = [value for request in requests.items() for value in request]
+        await redis.eval(  # type: ignore[no-untyped-call]  # Redis 4's stubs leave EVAL untyped.
+            _REMOVE_ABORT_REQUESTS, 1, abort_jobs_ss, *args
         )
-        requested.extend(job_id.decode() for job_id in ids)
-
-    return requested
 
 
 _REQUEST_ABORTS = """

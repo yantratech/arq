@@ -4,7 +4,7 @@ in_progress_key_prefix = 'arq:in-progress:'
 result_key_prefix = 'arq:result:'
 retry_key_prefix = 'arq:retry:'
 abort_jobs_ss = 'arq:abort'
-# age of items in the abort_key sorted set after which they're deleted
+# minimum age in seconds before orphaned abort requests may be deleted
 abort_job_max_age = 60
 health_check_key_suffix = ':health-check'
 # how long to keep the "in_progress" key after a cron job ends to prevent the job duplication

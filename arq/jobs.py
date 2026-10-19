@@ -9,7 +9,8 @@ from typing import Any, Callable, Optional
 
 from redis.asyncio import Redis
 
-from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from .abort import request_abort_jobs
+from .constants import default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
 from .utils import ms_to_datetime, poll, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
@@ -177,14 +178,7 @@ class Job:
         :param poll_delay: how often to poll redis for the job result
         :return: True if the job aborted properly, False otherwise
         """
-        job_info = await self.info()
-        if job_info and job_info.score and job_info.score > timestamp_ms():
-            async with self._redis.pipeline(transaction=True) as tr:
-                tr.zrem(self._queue_name, self.job_id)
-                tr.zadd(self._queue_name, {self.job_id: 1})
-                await tr.execute()
-
-        await self._redis.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
+        await request_abort_jobs(self._redis, [self.job_id], self._queue_name)
 
         try:
             info = await self._wait_for_result(timeout, poll_delay)

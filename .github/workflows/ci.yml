@@ -4,9 +4,10 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '**'
   pull_request: {}
+
+permissions:
+  contents: read
 
 env:
   COLUMNS: 150
@@ -17,9 +18,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-    - uses: astral-sh/setup-uv@v7
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       with:
         python-version: '3.13'
 
@@ -35,9 +36,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-    - uses: astral-sh/setup-uv@v7
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       with:
         python-version: '3.13'
 
@@ -46,7 +47,7 @@ jobs:
     - run: make docs
 
     - name: Store docs site
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       with:
         name: docs
         path: docs/_build/
@@ -66,6 +67,9 @@ jobs:
           - python: '3.11'
             redis: '7'
             os: 'ubuntu'
+          - python: '3.13'
+            redis: '8'
+            os: 'ubuntu'
 
     env:
       PYTHON: ${{ matrix.python }}
@@ -75,19 +79,24 @@ jobs:
     runs-on: ${{ matrix.os }}-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-    - uses: astral-sh/setup-uv@v7
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       with:
         python-version: ${{ matrix.python }}
 
     - run: uv sync --group testing --extra watch
 
+    - name: Pull test containers
+      run: |
+        docker pull "redis:${ARQ_TEST_REDIS_VERSION}"
+        docker pull "$(uv run python -c 'from testcontainers.core.config import testcontainers_config; print(testcontainers_config.ryuk_image)')"
+
     - run: make test
 
     - run: uv run coverage xml
 
-    - uses: codecov/codecov-action@v5
+    - uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
       with:
         file: ./coverage.xml
         env_vars: PYTHON,OS
@@ -99,52 +108,7 @@ jobs:
 
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@release/v1
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
         id: all-green
         with:
           jobs: ${{ toJSON(needs) }}
-
-  release:
-    name: Release
-    needs: [check]
-    if: "success() && startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
-    environment: release
-
-    permissions:
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: get docs
-        uses: actions/download-artifact@v6
-        with:
-          name: docs
-          path: docs/_build/
-
-      - name: set up python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      - name: install
-        run: pip install -U build
-
-      - name: check version
-        id: check-version
-        uses: samuelcolvin/check-python-version@v5
-        with:
-          version_file_path: 'arq/version.py'
-
-      - name: build
-        run: python -m build
-
-      - name: Upload package to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-
-      - name: publish docs
-        if: '!fromJSON(steps.check-version.outputs.IS_PRERELEASE)'
-        run: make publish-docs
-        env:
-          NETLIFY: ${{ secrets.netlify_token }}

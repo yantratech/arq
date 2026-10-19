@@ -3,6 +3,14 @@
 History
 -------
 
+v0.29.0 (2026-10-19)
+....................
+
+* Add bounded bulk cancellation submission with ``ArqRedis.request_abort_jobs()``. Returning confirms submission, not that jobs stopped; workers require ``allow_abort_jobs=True``.
+* Atomically register cancellation requests and promote deferred jobs without recreating completed queue entries.
+* Preserve caller cancellation and pending abort requests during Redis failures, and safely clean up orphaned requests.
+* Validate the Yantra fork against Python 3.9–3.14 and Redis 5–8 without automatic package or documentation publication.
+
 v0.28.0 (2026-04-16)
 ....................
 

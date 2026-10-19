@@ -101,6 +101,10 @@ class Job:
             )
             poll_delay = pole_delay
 
+        info = await self._wait_for_result(timeout, poll_delay)
+        return _unwrap_result(info)
+
+    async def _wait_for_result(self, timeout: Optional[float], poll_delay: float) -> JobResult:
         async for delay in poll(poll_delay):
             async with self._redis.pipeline(transaction=True) as tr:
                 tr.get(result_key_prefix + self.job_id)
@@ -108,13 +112,7 @@ class Job:
                 v, s = await tr.execute()
 
             if v:
-                info = deserialize_result(v, deserializer=self._deserializer)
-                if info.success:
-                    return info.result
-                elif isinstance(info.result, (Exception, asyncio.CancelledError)):
-                    raise info.result
-                else:
-                    raise SerializationError(info.result)
+                return deserialize_result(v, deserializer=self._deserializer)
             elif s is None:
                 raise ResultNotFound(
                     'Not waiting for job result because the job is not in queue. '
@@ -123,6 +121,8 @@ class Job:
 
             if timeout is not None and delay > timeout:
                 raise asyncio.TimeoutError()
+
+        raise AssertionError('poll ended without a result')
 
     async def info(self) -> Optional[JobDef]:
         """
@@ -187,17 +187,29 @@ class Job:
         await self._redis.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
 
         try:
-            await self.result(timeout=timeout, poll_delay=poll_delay)
-        except asyncio.CancelledError:
-            return True
+            info = await self._wait_for_result(timeout, poll_delay)
         except ResultNotFound:
-            # We do not know if the job was cancelled or not
+            # A missing result does not establish whether cancellation succeeded.
             return False
-        else:
-            return False
+
+        if not info.success and isinstance(info.result, asyncio.CancelledError):
+            return True
+
+        _unwrap_result(info)
+        return False
 
     def __repr__(self) -> str:
         return f'<arq job {self.job_id}>'
+
+
+def _unwrap_result(info: JobResult) -> object:
+    if info.success:
+        return info.result
+
+    if isinstance(info.result, (Exception, asyncio.CancelledError)):
+        raise info.result
+
+    raise SerializationError(info.result)
 
 
 class SerializationError(RuntimeError):

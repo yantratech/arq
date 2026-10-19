@@ -16,9 +16,9 @@ from redis.exceptions import ResponseError, WatchError
 from arq.cron import CronJob
 from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
 
+from .abort import cleanup_abort_requests, remove_abort_requests
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
 from .constants import (
-    abort_job_max_age,
     abort_jobs_ss,
     default_queue_name,
     expires_extra_ms,
@@ -293,6 +293,7 @@ class Worker:
         # whether or not to retry jobs on Retry and CancelledError
         self.retry_jobs = retry_jobs
         self.allow_abort_jobs = allow_abort_jobs
+        self._abort_scan_cursor = 0
         self.allow_pick_jobs: bool = True
         self.aborting_tasks: set[str] = set()
         self.max_burst_jobs = max_burst_jobs
@@ -409,25 +410,23 @@ class Worker:
         """
         Go through job_ids in the abort_jobs_ss sorted set and cancel those tasks.
         """
-        async with self.pool.pipeline(transaction=True) as pipe:
-            pipe.zrange(abort_jobs_ss, start=0, end=-1)
-            pipe.zremrangebyscore(abort_jobs_ss, min=timestamp_ms() + abort_job_max_age, max=float('inf'))
-            abort_job_ids, _ = await pipe.execute()
+        job_tasks = list(self.job_tasks.items())
+        for start in range(0, len(job_tasks), 100):
+            batch = job_tasks[start : start + 100]
+            async with self.pool.pipeline(transaction=False) as pipe:
+                for job_id, _ in batch:
+                    pipe.zscore(abort_jobs_ss, job_id)
+                scores = await pipe.execute()
 
-        aborted: set[str] = set()
-        for job_id_bytes in abort_job_ids:
-            job_id = job_id_bytes.decode()
-            try:
-                task = self.job_tasks[job_id]
-            except KeyError:
-                pass
-            else:
-                aborted.add(job_id)
-                task.cancel()
+            cancelled: dict[str, float] = {}
+            for (job_id, task), score in zip(batch, scores):
+                if score is not None and self.job_tasks.get(job_id) is task and task.cancel():
+                    self.aborting_tasks.add(job_id)
+                    cancelled[job_id] = score
 
-        if aborted:
-            self.aborting_tasks.update(aborted)
-            await self.pool.zrem(abort_jobs_ss, *aborted)
+            await remove_abort_requests(self.pool, cancelled)
+
+        self._abort_scan_cursor = await cleanup_abort_requests(self.pool, self._abort_scan_cursor)
 
     def _release_sem_dec_counter_on_complete(self) -> None:
         self.job_counter = self.job_counter - 1
@@ -620,7 +619,6 @@ class Worker:
                 logger.info('%6.2fs ⊘ %s aborted', t, ref)
                 result = e
                 finish = True
-                self.aborting_tasks.remove(job_id)
                 self.jobs_failed += 1
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
                 logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
@@ -638,6 +636,8 @@ class Worker:
             logger.info('%6.2fs ← %s ● %s', (finished_ms - start_ms) / 1000, ref, result_str)
             finish = True
             self.jobs_complete += 1
+        finally:
+            self.aborting_tasks.discard(job_id)
 
         keep_result_forever = (
             self.keep_result_forever if function.keep_result_forever is None else function.keep_result_forever

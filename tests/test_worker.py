@@ -880,6 +880,11 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     assert worker.aborting_tasks == set()
     assert worker.tasks == {}
     assert worker.job_tasks == {}
+    assert [
+        (record.arq_job_outcome, record.arq_exception_type)
+        for record in caplog.records
+        if hasattr(record, 'arq_job_outcome')
+    ] == [('cancelled', 'CancelledError')]
 
 
 async def test_abort_job_which_is_not_in_queue(arq_redis: ArqRedis):

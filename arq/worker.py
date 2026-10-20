@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from signal import Signals
 from time import time
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
 
 from redis.exceptions import ResponseError, WatchError
 
@@ -46,6 +46,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger('arq.worker')
 no_result = object()
+
+
+def _outcome_metadata(
+    outcome: Literal['terminal', 'retrying', 'cancelled', 'cancelled_unknown', 'succeeded'],
+    exception_type: Optional[type[BaseException]] = None,
+) -> dict[str, str]:
+    metadata: dict[str, str] = {'arq_job_outcome': outcome}
+    if exception_type is not None:
+        metadata['arq_exception_type'] = exception_type.__name__
+
+    return metadata
 
 
 @dataclass
@@ -511,7 +522,7 @@ class Worker:
             await asyncio.shield(self.finish_failed_job(job_id, result_data_))
 
         if not v:
-            logger.warning('job %s expired', job_id)
+            logger.warning('job %s expired', job_id, extra=_outcome_metadata('terminal', JobExecutionFailed))
             return await job_failed(JobExecutionFailed('job expired'))
 
         try:
@@ -519,18 +530,29 @@ class Worker:
                 v, deserializer=self.job_deserializer
             )
         except SerializationError as e:
-            logger.exception('deserializing job %s failed', job_id)
+            logger.exception('deserializing job %s failed', job_id, extra=_outcome_metadata('terminal', type(e)))
             return await job_failed(e)
 
         if abort_job:
             t = (timestamp_ms() - enqueue_time_ms) / 1000
-            logger.info('%6.2fs ⊘ %s:%s aborted before start', t, job_id, function_name)
+            logger.info(
+                '%6.2fs ⊘ %s:%s aborted before start',
+                t,
+                job_id,
+                function_name,
+                extra=_outcome_metadata('cancelled', asyncio.CancelledError),
+            )
             return await job_failed(asyncio.CancelledError())
 
         try:
             function: Union[Function, CronJob] = self.functions[function_name]
         except KeyError:
-            logger.warning('job %s, function %r not found', job_id, function_name)
+            logger.warning(
+                'job %s, function %r not found',
+                job_id,
+                function_name,
+                extra=_outcome_metadata('terminal', JobExecutionFailed),
+            )
             return await job_failed(JobExecutionFailed(f'function {function_name!r} not found'))
 
         if hasattr(function, 'next_run'):
@@ -548,7 +570,13 @@ class Worker:
         max_tries = self.max_tries if function.max_tries is None else function.max_tries
         if job_try > max_tries:
             t = (timestamp_ms() - enqueue_time_ms) / 1000
-            logger.warning('%6.2fs ! %s max retries %d exceeded', t, ref, max_tries)
+            logger.warning(
+                '%6.2fs ! %s max retries %d exceeded',
+                t,
+                ref,
+                max_tries,
+                extra=_outcome_metadata('terminal', JobExecutionFailed),
+            )
             self.jobs_failed += 1
             result_data = serialize_result(
                 function_name,
@@ -611,21 +639,47 @@ class Worker:
             t = (finished_ms - start_ms) / 1000
             if self.retry_jobs and isinstance(e, Retry):
                 incr_score = e.defer_score
-                logger.info('%6.2fs ↻ %s retrying job in %0.2fs', t, ref, (e.defer_score or 0) / 1000)
+                logger.info(
+                    '%6.2fs ↻ %s retrying job in %0.2fs',
+                    t,
+                    ref,
+                    (e.defer_score or 0) / 1000,
+                    extra=_outcome_metadata('retrying', type(e)),
+                )
                 if e.defer_score:
                     incr_score = e.defer_score + (timestamp_ms() - score)
                 self.jobs_retried += 1
             elif job_id in self.aborting_tasks and isinstance(e, asyncio.CancelledError):
-                logger.info('%6.2fs ⊘ %s aborted', t, ref)
+                logger.info(
+                    '%6.2fs ⊘ %s aborted',
+                    t,
+                    ref,
+                    extra=_outcome_metadata('cancelled', type(e)),
+                )
                 result = e
                 finish = True
                 self.jobs_failed += 1
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
-                logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
+                logger.info(
+                    '%6.2fs ↻ %s cancelled, will be run again',
+                    t,
+                    ref,
+                    extra=_outcome_metadata('retrying', type(e)),
+                )
                 self.jobs_retried += 1
             else:
                 logger.exception(
-                    '%6.2fs ! %s failed, %s: %s', t, ref, e.__class__.__name__, e, extra={'extra': exc_extra}
+                    '%6.2fs ! %s failed, %s: %s',
+                    t,
+                    ref,
+                    e.__class__.__name__,
+                    e,
+                    extra={
+                        'extra': exc_extra,
+                        **_outcome_metadata(
+                            'cancelled_unknown' if isinstance(e, asyncio.CancelledError) else 'terminal', type(e)
+                        ),
+                    },
                 )
                 result = e
                 finish = True
@@ -633,7 +687,13 @@ class Worker:
         else:
             success = True
             finished_ms = timestamp_ms()
-            logger.info('%6.2fs ← %s ● %s', (finished_ms - start_ms) / 1000, ref, result_str)
+            logger.info(
+                '%6.2fs ← %s ● %s',
+                (finished_ms - start_ms) / 1000,
+                ref,
+                result_str,
+                extra=_outcome_metadata('succeeded'),
+            )
             finish = True
             self.jobs_complete += 1
         finally:

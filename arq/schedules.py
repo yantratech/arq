@@ -8,15 +8,15 @@ from dataclasses import dataclass
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
-from .constants import in_progress_key_prefix, job_key_prefix
+from .constants import in_progress_key_prefix, job_key_prefix, retry_key_prefix
 
 
 def schedule_key(queue_name: str, job_id: str) -> str:
-    return f'{queue_name}:cron-schedule:{job_id}'
+    return 'arq:cron-schedule:' + json.dumps([queue_name, job_id], separators=(',', ':'))
 
 
 def schedule_applied_key(queue_name: str, job_id: str) -> str:
-    return schedule_key(queue_name, job_id) + ':applied'
+    return 'arq:cron-schedule-applied:' + json.dumps([queue_name, job_id], separators=(',', ':'))
 
 
 @dataclass(frozen=True)
@@ -66,7 +66,7 @@ async def update_cron_schedule(redis: Redis[bytes], *, queue_name: str, job_id: 
             pipe.multi()
             pipe.set(key, encoded)
             if not running:
-                pipe.delete(job_key)
+                pipe.delete(job_key, retry_key_prefix + job_id)
                 pipe.zrem(queue_name, job_id)
 
             try:

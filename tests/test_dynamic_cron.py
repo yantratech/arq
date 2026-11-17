@@ -2,9 +2,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from arq import cron
-from arq.constants import in_progress_key_prefix, job_key_prefix
-from arq.schedules import CronSchedule, schedule_key, update_cron_schedule
+from arq import Retry, cron
+from arq.constants import in_progress_key_prefix, job_key_prefix, retry_key_prefix
+from arq.schedules import CronSchedule, schedule_applied_key, schedule_key, update_cron_schedule
 from arq.worker import Worker
 
 
@@ -58,10 +58,12 @@ async def test_disabling_preserves_running_copy_and_reenable(arq_redis):
     queue, job_id = 'test:dynamic', 'transfer'
     await arq_redis.enqueue_job('transfer', _job_id=job_id, _queue_name=queue)
     await arq_redis.set(in_progress_key_prefix + job_id, b'1')
+    await arq_redis.set(retry_key_prefix + job_id, b'2')
     disabled = CronSchedule(1, frozenset())
     await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=disabled)
     assert await arq_redis.exists(job_key_prefix + job_id)
     assert await arq_redis.exists(in_progress_key_prefix + job_id)
+    assert await arq_redis.get(retry_key_prefix + job_id) == b'2'
 
     with pytest.raises(ValueError, match='Conflicting'):
         await update_cron_schedule(
@@ -136,3 +138,98 @@ async def test_replicas_acknowledge_updates_and_share_unique_due_job(arq_redis):
 
     assert seen == [(job_id, 1), (job_id, 1)]
     assert await arq_redis.zcard(queue) == 1
+
+
+async def test_acknowledgements_preserve_distinct_job_schedules(arq_redis):
+    queue = 'test:dynamic'
+    schedules = {'foo': CronSchedule(1, frozenset({5})), 'foo:applied': CronSchedule(2, frozenset({10}))}
+    for job_id, schedule in schedules.items():
+        await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=schedule)
+    worker = Worker(
+        cron_jobs=[cron(transfer, name=job_id, job_id=job_id, dynamic=True) for job_id in schedules],
+        redis_pool=arq_redis,
+        queue_name=queue,
+        handle_signals=False,
+    )
+    worker._pool = arq_redis
+    await worker.run_cron(datetime(2030, 1, 1, tzinfo=timezone.utc), 1)
+    for job, (job_id, schedule) in zip(worker.cron_jobs, schedules.items()):
+        assert job.minute == schedule.minutes
+        assert await arq_redis.get(schedule_key(queue, job_id)) == schedule.encode()
+        assert await arq_redis.ttl(schedule_key(queue, job_id)) == -1
+        assert await arq_redis.get(schedule_applied_key(queue, job_id)) == schedule.encode()
+
+
+@pytest.mark.parametrize('initially_disabled', [False, True])
+async def test_revisions_schedule_future_runs_without_replaying_startup(arq_redis, initially_disabled):
+    queue, job_id = 'test:dynamic', 'transfer'
+    calls = []
+
+    async def run(ctx):
+        calls.append(ctx['job_try'])
+
+    worker = Worker(
+        cron_jobs=[
+            cron(
+                run,
+                name=job_id,
+                job_id=job_id,
+                minute=set() if initially_disabled else {5},
+                dynamic=True,
+                run_at_startup=True,
+            )
+        ],
+        redis_pool=arq_redis,
+        queue_name=queue,
+        handle_signals=False,
+    )
+    worker._pool = arq_redis
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    await worker.run_cron(now, 1)
+    if not initially_disabled:
+        await worker.run_job(job_id, 0)
+        assert calls == [1]
+
+    for revision, minutes in [(1, {10}), (2, set()), (3, {20})]:
+        await update_cron_schedule(
+            arq_redis, queue_name=queue, job_id=job_id, schedule=CronSchedule(revision, frozenset(minutes))
+        )
+        await worker.run_cron(now, 1)
+        if minutes:
+            assert worker.cron_jobs[0].next_run.minute == min(minutes)
+        assert await arq_redis.zcard(queue) == 0
+
+    await worker.run_cron(now.replace(minute=19, second=59), 1)
+    assert await arq_redis.zcard(queue) == 1
+
+
+async def test_replacement_occurrence_gets_a_fresh_retry_budget(arq_redis):
+    queue, job_id = 'test:dynamic', 'transfer'
+    attempts = []
+
+    async def run(ctx):
+        attempts.append(ctx['job_try'])
+        if len(attempts) == 1:
+            raise Retry(defer=60)
+
+    worker = Worker(
+        cron_jobs=[cron(run, name=job_id, job_id=job_id, minute={5}, dynamic=True, max_tries=1)],
+        redis_pool=arq_redis,
+        queue_name=queue,
+        handle_signals=False,
+    )
+    worker._pool = arq_redis
+    now = datetime(2030, 1, 1, 0, 4, 59, tzinfo=timezone.utc)
+    await worker.run_cron(now, 1)
+    await worker.run_cron(now, 1)
+    await worker.run_job(job_id, 0)
+    assert attempts == [1]
+    assert await arq_redis.get(retry_key_prefix + job_id) == b'1'
+
+    await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=CronSchedule(1, frozenset({10})))
+    await worker.run_cron(now, 1)
+    await worker.run_cron(now.replace(minute=9), 1)
+    await worker.run_job(job_id, 0)
+    assert attempts == [1, 1]
+    assert worker.jobs_complete == 1
+    assert worker.jobs_failed == 0

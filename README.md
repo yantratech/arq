@@ -35,7 +35,7 @@ await update_cron_schedule(
 )
 ```
 
-The application owns durable configuration and increasing revisions. Equal revisions must have identical contents; older updates are ignored. Workers reload the shared schedule on their normal scheduler tick, calculate the next matching time and enqueue only due work. Updates withdraw waiting work and preserve running work. Enqueue transactions reject stale schedule snapshots, including snapshots from other worker replicas. The worker's job-claim transaction protects waiting-work removal from racing with execution.
+The application owns durable configuration and increasing revisions. Equal revisions must have identical contents; older updates are ignored. Workers reload the shared schedule on their normal scheduler tick, calculate the next matching time and enqueue only due work. Updates withdraw waiting work and its retry count, and preserve running work. Startup execution is eligible only on the first scheduler tick; later revisions and re-enabling use the next matching time. Enqueue transactions reject stale schedule snapshots, including snapshots from other worker replicas. The worker's job-claim transaction protects waiting-work removal from racing with execution.
 
 Load durable overrides before worker startup completes. If Redis loses an override a running worker has observed, that worker suspends its schedule until the application restores the override. Reconcile from durable storage after reconnects and Redis loss.
 

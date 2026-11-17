@@ -243,6 +243,7 @@ class Worker:
         self._cron_schedule_values: dict[str, bytes] = {}
         self._cron_default_minutes: dict[str, frozenset[int]] = {}
         self._cron_seen_overrides: set[str] = set()
+        self._cron_initialized: set[int] = set()
         self.cron_jobs: list[CronJob] = []
         if cron_jobs is not None:
             if not all(isinstance(cj, CronJob) for cj in cron_jobs):
@@ -848,6 +849,8 @@ class Worker:
         this_hb_cutoff = n + cron_delay
 
         for cron_job in self.cron_jobs:
+            first_tick = id(cron_job) not in self._cron_initialized
+            self._cron_initialized.add(id(cron_job))
             schedule_guard = None
             if cron_job.dynamic:
                 schedule_guard = await self._read_cron_schedule(cron_job)
@@ -855,7 +858,7 @@ class Worker:
                     continue
 
             if cron_job.next_run is None:
-                if cron_job.run_at_startup:
+                if cron_job.run_at_startup and first_tick:
                     cron_job.next_run = n
                 else:
                     cron_job.calculate_next(n)

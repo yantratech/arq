@@ -140,6 +140,44 @@ async def test_replicas_acknowledge_updates_and_share_unique_due_job(arq_redis):
     assert await arq_redis.zcard(queue) == 1
 
 
+@pytest.mark.parametrize('run_at_startup', [False, True])
+async def test_schedule_change_reports_applied_minutes_and_next_occurrence(arq_redis, run_at_startup):
+    queue, job_id = 'test:dynamic', 'transfer'
+    seen = []
+
+    async def changed(ctx):
+        seen.append((ctx['cron_schedule_revision'], ctx['cron_schedule_minutes'], ctx['cron_next_run']))
+        assert ctx['cron_next_run'] == worker.cron_jobs[0].next_run
+
+    worker = Worker(
+        cron_jobs=[
+            cron(transfer, job_id=job_id, minute=set(range(0, 60, 2)), dynamic=True, run_at_startup=run_at_startup)
+        ],
+        redis_pool=arq_redis,
+        queue_name=queue,
+        handle_signals=False,
+        on_cron_schedule_change=changed,
+    )
+    worker._pool = arq_redis
+    now = datetime(2030, 1, 1, 13, 3, tzinfo=timezone.utc)
+    await worker.run_cron(now, 0.5)
+    initial_next = now if run_at_startup else now.replace(minute=4, microsecond=123456)
+    assert seen == [(0, frozenset(range(0, 60, 2)), initial_next)]
+
+    for revision, minutes, expected_next in [
+        (1, {0, 15, 30, 45}, now.replace(minute=15, microsecond=123456)),
+        (2, set(), None),
+        (3, {0}, now.replace(hour=14, minute=0, microsecond=123456)),
+    ]:
+        await update_cron_schedule(
+            arq_redis, queue_name=queue, job_id=job_id, schedule=CronSchedule(revision, frozenset(minutes))
+        )
+        await worker.run_cron(now, 0.5)
+        await worker.run_cron(now, 0.5)
+        assert seen[-1] == (revision, frozenset(minutes), expected_next)
+        assert len(seen) == revision + 1
+
+
 async def test_acknowledgements_preserve_distinct_job_schedules(arq_redis):
     queue = 'test:dynamic'
     schedules = {'foo': CronSchedule(1, frozenset({5})), 'foo:applied': CronSchedule(2, frozenset({10}))}

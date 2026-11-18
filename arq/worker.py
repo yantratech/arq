@@ -801,7 +801,9 @@ class Worker:
         cron_window_size = max(self.poll_delay_s, 0.5)  # Clamp the cron delay to 0.5
         await self.run_cron(now, cron_window_size)
 
-    async def _read_cron_schedule(self, cron_job: CronJob) -> Optional[tuple[str, Optional[bytes]]]:
+    async def _read_cron_schedule(
+        self, cron_job: CronJob, now: datetime, first_tick: bool
+    ) -> Optional[tuple[str, Optional[bytes], bool]]:
         if cron_job.job_id is None:
             raise ValueError('Dynamic cron jobs require a fixed job_id')
 
@@ -824,6 +826,12 @@ class Worker:
         if changed:
             cron_job.minute = set(schedule.minutes)
             cron_job.next_run = None
+            if schedule.minutes:
+                if cron_job.run_at_startup and first_tick:
+                    cron_job.next_run = now
+                else:
+                    cron_job.calculate_next(now)
+
             self._cron_schedule_values[key] = encoded
 
         await self.pool.set(schedule_applied_key(self.queue_name, cron_job.job_id), encoded, ex=10)
@@ -833,13 +841,15 @@ class Worker:
                     **self.ctx,
                     'cron_job_id': cron_job.job_id,
                     'cron_schedule_revision': schedule.revision,
+                    'cron_schedule_minutes': schedule.minutes,
+                    'cron_next_run': cron_job.next_run,
                 }
             )
 
         if not schedule.minutes:
             return None
 
-        return key, value
+        return key, value, changed
 
     async def run_cron(self, n: datetime, delay: float, num_windows: int = 2) -> None:
         job_futures = set()
@@ -853,8 +863,13 @@ class Worker:
             self._cron_initialized.add(id(cron_job))
             schedule_guard = None
             if cron_job.dynamic:
-                schedule_guard = await self._read_cron_schedule(cron_job)
-                if schedule_guard is None:
+                schedule_state = await self._read_cron_schedule(cron_job, n, first_tick)
+                if schedule_state is None:
+                    continue
+
+                key, value, changed = schedule_state
+                schedule_guard = key, value
+                if changed and not (cron_job.run_at_startup and first_tick):
                     continue
 
             if cron_job.next_run is None:

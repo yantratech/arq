@@ -128,6 +128,7 @@ class ArqRedis(BaseRedis):
         _defer_by: Union[None, int, float, timedelta] = None,
         _expires: Union[None, int, float, timedelta] = None,
         _job_try: Optional[int] = None,
+        _cron_schedule: Optional[tuple[str, Optional[bytes]]] = None,
         **kwargs: Any,
     ) -> Optional[Job]:
         """
@@ -157,6 +158,11 @@ class ArqRedis(BaseRedis):
 
         async with self.pipeline(transaction=True) as pipe:
             await pipe.watch(job_key)
+            if _cron_schedule is not None:
+                schedule_key, expected = _cron_schedule
+                await pipe.watch(schedule_key)
+                if await pipe.get(schedule_key) != expected:
+                    return None
             if await pipe.exists(job_key, result_key_prefix + job_id):
                 await pipe.reset()
                 return None

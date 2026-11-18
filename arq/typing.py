@@ -41,6 +41,7 @@ class WorkerSettingsBase(Protocol):
     functions: Sequence[Union[WorkerCoroutine, 'Function']]
     cron_jobs: Optional[Sequence['CronJob']] = None
     on_startup: Optional[StartupShutdown] = None
+    on_cron_schedule_change: Optional[StartupShutdown] = None
     on_shutdown: Optional[StartupShutdown] = None
     # and many more...
 

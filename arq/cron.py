@@ -108,6 +108,7 @@ class CronJob:
     keep_result_forever: Optional[bool]
     max_tries: Optional[int]
     next_run: Optional[datetime] = None
+    dynamic: bool = False
 
     def calculate_next(self, prev_run: datetime) -> None:
         self.next_run = next_cron(
@@ -143,6 +144,7 @@ def cron(
     keep_result: Optional[float] = 0,
     keep_result_forever: Optional[bool] = False,
     max_tries: Optional[int] = 1,
+    dynamic: bool = False,
 ) -> CronJob:
     """
     Create a cron job, eg. it should be executed at specific times.
@@ -166,8 +168,12 @@ def cron(
     :param timeout: job timeout
     :param keep_result: how long to keep the result for
     :param keep_result_forever: whether to keep results forever
+    :param dynamic: read a revisioned minute schedule from Redis; requires a fixed job_id
     :param max_tries: maximum number of tries for the job
     """
+
+    if dynamic and not job_id:
+        raise ValueError('Dynamic cron jobs require a fixed job_id')
 
     if isinstance(coroutine, str):
         name = name or 'cron:' + coroutine
@@ -197,4 +203,5 @@ def cron(
         keep_result,
         keep_result_forever,
         max_tries,
+        dynamic=dynamic,
     )

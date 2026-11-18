@@ -15,6 +15,7 @@ from redis.exceptions import ResponseError, WatchError
 
 from arq.cron import CronJob
 from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
+from arq.schedules import CronSchedule, schedule_applied_key, schedule_key
 
 from .abort import cleanup_abort_requests, remove_abort_requests
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
@@ -160,6 +161,7 @@ class Worker:
     :param redis_settings: settings for creating a redis connection
     :param redis_pool: existing redis pool, generally None
     :param burst: whether to stop the worker once all jobs have been run
+    :param on_cron_schedule_change: coroutine called when a dynamic schedule is applied
     :param on_startup: coroutine function to run at startup
     :param on_shutdown: coroutine function to run at shutdown
     :param on_job_start: coroutine function to run on job start
@@ -205,6 +207,7 @@ class Worker:
         redis_pool: Optional[ArqRedis] = None,
         burst: bool = False,
         on_startup: Optional['StartupShutdown'] = None,
+        on_cron_schedule_change: Optional['StartupShutdown'] = None,
         on_shutdown: Optional['StartupShutdown'] = None,
         on_job_start: Optional['StartupShutdown'] = None,
         on_job_end: Optional['StartupShutdown'] = None,
@@ -237,6 +240,10 @@ class Worker:
             else:
                 raise ValueError('If queue_name is absent, redis_pool must be present.')
         self.queue_name = queue_name
+        self._cron_schedule_values: dict[int, bytes] = {}
+        self._cron_default_minutes: dict[int, frozenset[int]] = {}
+        self._cron_seen_overrides: set[str] = set()
+        self._cron_initialized: set[int] = set()
         self.cron_jobs: list[CronJob] = []
         if cron_jobs is not None:
             if not all(isinstance(cj, CronJob) for cj in cron_jobs):
@@ -246,6 +253,7 @@ class Worker:
         if len(self.functions) == 0:
             raise RuntimeError('at least one function or cron_job must be registered')
         self.burst = burst
+        self.on_cron_schedule_change = on_cron_schedule_change
         self.on_startup = on_startup
         self.on_shutdown = on_shutdown
         self.on_job_start = on_job_start
@@ -459,7 +467,7 @@ class Worker:
             job_id = job_id_b.decode()
             in_progress_key = in_progress_key_prefix + job_id
             async with self.pool.pipeline(transaction=True) as pipe:
-                await pipe.watch(in_progress_key)
+                await pipe.watch(in_progress_key, job_key_prefix + job_id)
                 ongoing_exists = await pipe.exists(in_progress_key)
                 score = await pipe.zscore(self.queue_name, job_id)
                 if ongoing_exists or not score or score > timestamp_ms():
@@ -755,7 +763,7 @@ class Worker:
             if keep_in_progress is None:
                 delete_keys += [in_progress_key]
             else:
-                tr.pexpire(in_progress_key, to_ms(keep_in_progress))
+                tr.psetex(in_progress_key, to_ms(keep_in_progress), b'complete')
 
             if finish:
                 if result_data:
@@ -793,6 +801,61 @@ class Worker:
         cron_window_size = max(self.poll_delay_s, 0.5)  # Clamp the cron delay to 0.5
         await self.run_cron(now, cron_window_size)
 
+    async def _read_cron_schedule(
+        self, cron_job: CronJob, now: datetime, first_tick: bool
+    ) -> Optional[tuple[str, Optional[bytes], bool]]:
+        if cron_job.job_id is None:
+            raise ValueError('Dynamic cron jobs require a fixed job_id')
+
+        key = schedule_key(self.queue_name, cron_job.job_id)
+        registration = id(cron_job)
+        if registration not in self._cron_default_minutes:
+            minutes = cron_job.minute
+            self._cron_default_minutes[registration] = frozenset(
+                range(60) if minutes is None else {minutes} if isinstance(minutes, int) else minutes
+            )
+
+        value = await self.pool.get(key)
+        if value is None and key in self._cron_seen_overrides:
+            return None
+
+        if value is not None:
+            self._cron_seen_overrides.add(key)
+        schedule = (
+            CronSchedule.decode(value)
+            if value is not None
+            else CronSchedule(0, self._cron_default_minutes[registration])
+        )
+        encoded = schedule.encode()
+        changed = self._cron_schedule_values.get(registration) != encoded
+        if changed:
+            cron_job.minute = set(schedule.minutes)
+            cron_job.next_run = None
+            if schedule.minutes:
+                if cron_job.run_at_startup and first_tick:
+                    cron_job.next_run = now
+                else:
+                    cron_job.calculate_next(now)
+
+            self._cron_schedule_values[registration] = encoded
+
+        await self.pool.set(schedule_applied_key(self.queue_name, cron_job.job_id), encoded, ex=10)
+        if changed and self.on_cron_schedule_change:
+            await self.on_cron_schedule_change(
+                {
+                    **self.ctx,
+                    'cron_job_id': cron_job.job_id,
+                    'cron_schedule_revision': schedule.revision,
+                    'cron_schedule_minutes': schedule.minutes,
+                    'cron_next_run': cron_job.next_run,
+                }
+            )
+
+        if not schedule.minutes:
+            return None
+
+        return key, value, changed
+
     async def run_cron(self, n: datetime, delay: float, num_windows: int = 2) -> None:
         job_futures = set()
 
@@ -801,8 +864,21 @@ class Worker:
         this_hb_cutoff = n + cron_delay
 
         for cron_job in self.cron_jobs:
+            first_tick = id(cron_job) not in self._cron_initialized
+            self._cron_initialized.add(id(cron_job))
+            schedule_guard = None
+            if cron_job.dynamic:
+                schedule_state = await self._read_cron_schedule(cron_job, n, first_tick)
+                if schedule_state is None:
+                    continue
+
+                key, value, changed = schedule_state
+                schedule_guard = key, value
+                if changed and not (cron_job.run_at_startup and first_tick):
+                    continue
+
             if cron_job.next_run is None:
-                if cron_job.run_at_startup:
+                if cron_job.run_at_startup and first_tick:
                     cron_job.next_run = n
                 else:
                     cron_job.calculate_next(n)
@@ -821,6 +897,7 @@ class Worker:
                         cron_job.name,
                         _job_id=job_id,
                         _queue_name=self.queue_name,
+                        _cron_schedule=schedule_guard,
                         _defer_until=(
                             cron_job.next_run if cron_job.next_run > datetime.now(tz=self.timezone) else None
                         ),

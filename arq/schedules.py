@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
-from .constants import in_progress_key_prefix, job_key_prefix, retry_key_prefix
+from .constants import abort_jobs_ss, in_progress_key_prefix, job_key_prefix, retry_key_prefix
 
 
 def schedule_key(queue_name: str, job_id: str) -> str:
@@ -68,6 +68,7 @@ async def update_cron_schedule(redis: Redis[bytes], *, queue_name: str, job_id: 
             if not running:
                 pipe.delete(job_key, retry_key_prefix + job_id)
                 pipe.zrem(queue_name, job_id)
+                pipe.zrem(abort_jobs_ss, job_id)
 
             try:
                 await pipe.execute()

@@ -240,8 +240,8 @@ class Worker:
             else:
                 raise ValueError('If queue_name is absent, redis_pool must be present.')
         self.queue_name = queue_name
-        self._cron_schedule_values: dict[str, bytes] = {}
-        self._cron_default_minutes: dict[str, frozenset[int]] = {}
+        self._cron_schedule_values: dict[int, bytes] = {}
+        self._cron_default_minutes: dict[int, frozenset[int]] = {}
         self._cron_seen_overrides: set[str] = set()
         self._cron_initialized: set[int] = set()
         self.cron_jobs: list[CronJob] = []
@@ -808,9 +808,10 @@ class Worker:
             raise ValueError('Dynamic cron jobs require a fixed job_id')
 
         key = schedule_key(self.queue_name, cron_job.job_id)
-        if key not in self._cron_default_minutes:
+        registration = id(cron_job)
+        if registration not in self._cron_default_minutes:
             minutes = cron_job.minute
-            self._cron_default_minutes[key] = frozenset(
+            self._cron_default_minutes[registration] = frozenset(
                 range(60) if minutes is None else {minutes} if isinstance(minutes, int) else minutes
             )
 
@@ -820,9 +821,13 @@ class Worker:
 
         if value is not None:
             self._cron_seen_overrides.add(key)
-        schedule = CronSchedule.decode(value) if value is not None else CronSchedule(0, self._cron_default_minutes[key])
+        schedule = (
+            CronSchedule.decode(value)
+            if value is not None
+            else CronSchedule(0, self._cron_default_minutes[registration])
+        )
         encoded = schedule.encode()
-        changed = self._cron_schedule_values.get(key) != encoded
+        changed = self._cron_schedule_values.get(registration) != encoded
         if changed:
             cron_job.minute = set(schedule.minutes)
             cron_job.next_run = None
@@ -832,7 +837,7 @@ class Worker:
                 else:
                     cron_job.calculate_next(now)
 
-            self._cron_schedule_values[key] = encoded
+            self._cron_schedule_values[registration] = encoded
 
         await self.pool.set(schedule_applied_key(self.queue_name, cron_job.job_id), encoded, ex=10)
         if changed and self.on_cron_schedule_change:

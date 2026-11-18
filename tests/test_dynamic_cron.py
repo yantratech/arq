@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from arq import Retry, cron
-from arq.constants import in_progress_key_prefix, job_key_prefix, retry_key_prefix
+from arq.constants import abort_jobs_ss, in_progress_key_prefix, job_key_prefix, retry_key_prefix
 from arq.schedules import CronSchedule, schedule_applied_key, schedule_key, update_cron_schedule
 from arq.worker import Worker
 
@@ -59,8 +59,10 @@ async def test_disabling_preserves_running_copy_and_reenable(arq_redis):
     await arq_redis.enqueue_job('transfer', _job_id=job_id, _queue_name=queue)
     await arq_redis.set(in_progress_key_prefix + job_id, b'1')
     await arq_redis.set(retry_key_prefix + job_id, b'2')
+    await arq_redis.request_abort_jobs([job_id], queue_name=queue)
     disabled = CronSchedule(1, frozenset())
     await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=disabled)
+    assert await arq_redis.zscore(abort_jobs_ss, job_id) is not None
     assert await arq_redis.exists(job_key_prefix + job_id)
     assert await arq_redis.exists(in_progress_key_prefix + job_id)
     assert await arq_redis.get(retry_key_prefix + job_id) == b'2'
@@ -271,3 +273,51 @@ async def test_replacement_occurrence_gets_a_fresh_retry_budget(arq_redis):
     assert attempts == [1, 1]
     assert worker.jobs_complete == 1
     assert worker.jobs_failed == 0
+
+
+async def test_replacement_runs_after_withdrawing_an_abort_requested_occurrence(arq_redis):
+    queue, job_id = 'test:dynamic', 'transfer'
+    calls = []
+
+    async def run(ctx):
+        calls.append(ctx['job_id'])
+
+    worker = Worker(
+        cron_jobs=[cron(run, name=job_id, job_id=job_id, minute=5, dynamic=True)],
+        redis_pool=arq_redis,
+        queue_name=queue,
+        handle_signals=False,
+        allow_abort_jobs=True,
+    )
+    worker._pool = arq_redis
+    now = datetime(2030, 1, 1, 0, 4, 59, tzinfo=timezone.utc)
+    await worker.run_cron(now, 1)
+    await worker.run_cron(now, 1)
+    await arq_redis.request_abort_jobs([job_id], queue_name=queue)
+    assert await arq_redis.zscore(abort_jobs_ss, job_id) is not None
+
+    await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=CronSchedule(1, frozenset({10})))
+    await worker.run_cron(now, 1)
+    await worker.run_cron(now.replace(minute=9), 1)
+    await worker.run_job(job_id, 0)
+    assert calls == [job_id]
+
+
+async def test_shared_job_id_applies_override_to_each_registration(arq_redis):
+    queue, job_id = 'test:dynamic', 'shared'
+    jobs = [cron(transfer, name=f'transfer-{minute}', job_id=job_id, minute=minute, dynamic=True) for minute in (5, 20)]
+    worker = Worker(cron_jobs=jobs, redis_pool=arq_redis, queue_name=queue, handle_signals=False)
+    worker._pool = arq_redis
+    now = datetime(2030, 1, 1, 0, 0, tzinfo=timezone.utc)
+    await worker.run_cron(now, 1)
+    assert [job.next_run.minute for job in jobs] == [5, 20]
+
+    await update_cron_schedule(arq_redis, queue_name=queue, job_id=job_id, schedule=CronSchedule(1, frozenset({10})))
+    await worker.run_cron(now, 1)
+    assert [job.next_run.minute for job in jobs] == [10, 10]
+    await worker.run_cron(now.replace(minute=9, second=59), 1)
+    assert await arq_redis.zcard(queue) == 1
+
+    await worker.run_job(job_id, 0)
+    await worker.run_cron(now.replace(minute=19, second=59), 1)
+    assert await arq_redis.zcard(queue) == 0
